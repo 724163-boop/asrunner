@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EXE → 逆アセンブル & ブラウザ実行</title>
+  <!-- 必要なライブラリをCDNから読み込み -->
+  <script src="https://cdn.jsdelivr.net/npm/rzweb@latest/dist/rzweb.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://js-dos.com/6.22/current/js-dos.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #1e1e2f;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      min-height: 100vh;
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 20px; color: #ffb86c; }
+    .container {
+      width: 100%;
+      max-width: 1100px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .upload-area {
+      background: #2a2a3b;
+      border: 2px dashed #6272a4;
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+    }
+    .upload-area input[type="file"] {
+      margin-top: 10px;
+      color: #f8f8f2;
+    }
+    .status {
+      font-size: 0.9rem;
+      color: #bd93f9;
+      margin-top: 8px;
+    }
+    .two-panels {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .panel {
+      flex: 1;
+      min-width: 300px;
+      background: #2a2a3b;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .panel h2 {
+      font-size: 1.2rem;
+      margin-bottom: 12px;
+      color: #50fa7b;
+      border-bottom: 1px solid #44475a;
+      padding-bottom: 6px;
+    }
+    #disasm {
+      background: #21222c;
+      border: 1px solid #44475a;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: 'Courier New', monospace;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+      max-height: 400px;
+      overflow-y: auto;
+      color: #f8f8f2;
+    }
+    #dosbox-container {
+      background: #000;
+      border-radius: 8px;
+      min-height: 300px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #888;
+      font-size: 1rem;
+    }
+    .btn {
+      background: #bd93f9;
+      color: #1e1e2f;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: bold;
+      margin-top: 10px;
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <h1>🖥️ DOS EXE 解析 & ブラウザ実行</h1>
+  <div class="container">
+    <div class="upload-area">
+      <p>DOS の .exe または .com ファイルを選んでください（最大1MB推奨）</p>
+      <input type="file" id="fileInput" accept=".exe,.com">
+      <div class="status" id="status">ファイル未選択</div>
+    </div>
+
+    <div class="two-panels">
+      <div class="panel">
+        <h2>🔍 逆アセンブル結果（先頭200命令）</h2>
+        <div id="disasm">ここに表示されます</div>
+      </div>
+      <div class="panel">
+        <h2>🕹️ 実行画面（DOSBox）</h2>
+        <div id="dosbox-container">
+          <span id="dosbox-placeholder">起動待機中...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function() {
+      const fileInput = document.getElementById('fileInput');
+      const statusDiv = document.getElementById('status');
+      const disasmDiv = document.getElementById('disasm');
+      const dosboxContainer = document.getElementById('dosbox-container');
+      const placeholder = document.getElementById('dosbox-placeholder');
+
+      let currentDosbox = null; // 実行中の DOSBox インスタンス
+
+      fileInput.addEventListener('change', async (event) => {
+        const file = event.target.files[0];
+        if (!file) {
+          statusDiv.textContent = 'ファイル未選択';
+          return;
+        }
+
+        // 拡張子簡易チェック
+        if (!file.name.toLowerCase().endsWith('.exe') && !file.name.toLowerCase().endsWith('.com')) {
+          statusDiv.textContent = '⚠️ .exe または .com ファイルのみ対応しています';
+          return;
+        }
+
+        statusDiv.textContent = '読み込み中...';
+        disasmDiv.textContent = '解析中...';
+        
+        // 前回の実行を停止
+        if (currentDosbox) {
+          try {
+            await currentDosbox.stop();
+          } catch (e) { /* ignore */ }
+          currentDosbox = null;
+        }
+        // DOSBox表示をリセット
+        dosboxContainer.innerHTML = '';
+        dosboxContainer.appendChild(placeholder);
+        placeholder.textContent = '準備中...';
+
+        try {
+          // ファイルをバイナリとして読み込み
+          const arrayBuffer = await file.arrayBuffer();
+          const bytes = new Uint8Array(arrayBuffer);
+
+          // ===== 1. 逆アセンブル =====
+          statusDiv.textContent = '逆アセンブル中...';
+          let disasmText = '';
+          try {
+            const rz = await new RzWeb();
+            await rz.load(); // WASMバイナリの初期化
+            const fileId = rz.fileOpen(file.name, bytes);
+            rz.analyzeAll(); // コード解析
+            // pd 200 : 先頭から200命令を逆アセンブル
+            disasmText = rz.cmd("pd 200") || '(逆アセンブル結果なし)';
+            // RzWeb は内部状態を開放するためファイルを閉じる（任意）
+            rz.fileClose(fileId);
+          } catch (rzError) {
+            console.error(rzError);
+            disasmText = '逆アセンブルに失敗しました。有効なDOS実行ファイルではないかもしれません。';
+          }
+          disasmDiv.textContent = disasmText;
+
+          // ===== 2. DOSBox 用バンドルを作成 =====
+          statusDiv.textContent = '実行バンドル作成中...';
+          const zip = new JSZip();
+          // 自動実行の設定ファイル
+          const autoexecConfig = 
+`[autoexec]
+@echo off
+mount c .
+c:
+${file.name}
+`;
+          zip.file("dosbox.conf", autoexecConfig);
+          zip.file(file.name, bytes);
+
+          // zipをBlob化し、オブジェクトURLを生成
+          const blob = await zip.generateAsync({ type: "blob" });
+          const bundleUrl = URL.createObjectURL(blob);
+
+          // ===== 3. DOSBox 起動 =====
+          statusDiv.textContent = 'DOSBox 起動中...';
+          // プレースホルダーを削除し、js-dos に任せる
+          placeholder.remove();
+
+          // js-dos v6.22 の初期化（wdosbox のURLを指定）
+          currentDosbox = await Dos(dosboxContainer, {
+            wdosboxUrl: "https://js-dos.com/6.22/current/wdosbox.js"
+          });
+
+          // バンドルを実行
+          await currentDosbox.run(bundleUrl);
+          
+          statusDiv.textContent = '✅ 実行中（終了したら再度ファイルを選んでください）';
+          
+          // メモリリーク防止のため、js-dosがマウント完了後にURLを安全に解放
+          // （即時解放すると読み込みエラーになるため少し遅らせる）
+          setTimeout(() => URL.revokeObjectURL(bundleUrl), 10000);
+
+        } catch (error) {
+          console.error(error);
+          statusDiv.textContent = '❌ エラーが発生しました: ' + error.message;
+          disasmDiv.textContent = disasmDiv.textContent || 'エラー';
+          // DOSBoxコンテナを元に戻す
+          dosboxContainer.innerHTML = '';
+          dosboxContainer.appendChild(placeholder);
+          placeholder.textContent = '起動失敗';
+        }
+      });
+
+    })();
+  </script>
+</body>
+</html>
