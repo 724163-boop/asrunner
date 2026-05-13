@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EXE → 逆アセンブル & ブラウザ実行 (ZIP対応)</title>
+  <script src="https://cdn.jsdelivr.net/npm/rzweb@latest/dist/rzweb.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://js-dos.com/6.22/current/js-dos.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a0f; font-family: 'Segoe UI', system-ui, sans-serif; color: #ddd; user-select: none; -webkit-user-select: none; }
+    #app { display: flex; flex-direction: column; width: 100%; height: 100%; }
+    #topbar { display: flex; align-items: center; gap: 12px; padding: 6px 16px; background: #1a1a2e; border-bottom: 1px solid #2a2a44; z-index: 100; flex-shrink: 0; min-height: 40px; flex-wrap: wrap; }
+    #topbar .title { font-weight: 700; color: #ffb86c; font-size: 0.95rem; white-space: nowrap; }
+    #topbar input[type="file"] { color: #ccc; font-size: 0.85rem; max-width: 260px; }
+    #topbar button { background: #3a3a5c; color: #eee; border: 1px solid #555; padding: 5px 12px; border-radius: 5px; cursor: pointer; font-size: 0.85rem; white-space: nowrap; transition: background 0.2s; }
+    #topbar button:hover { background: #5a5a8c; }
+    #topbar button.active { background: #bd93f9; border-color: #bd93f9; color: #1a1a2e; }
+    #status { font-size: 0.8rem; color: #8be9fd; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
+    #gameArea { flex: 1; position: relative; background: #000; overflow: hidden; cursor: default; }
+    #dosbox-container { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+    #dosbox-container canvas { display: block; max-width: 100%; max-height: 100%; object-fit: contain; }
+    #placeholder { color: #555; font-size: 1.4rem; text-align: center; pointer-events: none; }
+    #pointerOverlay { position: absolute; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 1.3rem; font-weight: 600; pointer-events: none; opacity: 0; transition: opacity 0.35s ease; z-index: 50; letter-spacing: 0.04em; text-shadow: 0 0 20px rgba(255,255,255,0.6); }
+    #pointerOverlay.visible { opacity: 1; }
+    #pointerOverlay.locked { opacity: 0; }
+    #disasmPanel { position: absolute; top: 0; right: 0; width: 460px; max-width: 90vw; height: 100%; background: #1e1e30ee; backdrop-filter: blur(8px); border-left: 1px solid #444; z-index: 80; transform: translateX(100%); transition: transform 0.3s ease; display: flex; flex-direction: column; padding: 16px; overflow-y: auto; }
+    #disasmPanel.open { transform: translateX(0); }
+    #disasmPanel h3 { color: #50fa7b; margin-bottom: 12px; font-size: 1.05rem; border-bottom: 1px solid #333; padding-bottom: 8px; }
+    #disasm { font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace; font-size: 0.82rem; white-space: pre-wrap; color: #c0c0d0; line-height: 1.5; flex: 1; overflow-y: auto; }
+    @media (max-width: 700px) { #topbar { gap: 6px; padding: 4px 8px; } #topbar .title { font-size: 0.8rem; } #disasmPanel { width: 100%; max-width: 100%; } }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <span class="title">🖥️ DOS EXE Runner (ZIP対応)</span>
+      <input type="file" id="fileInput" accept=".exe,.com,.zip">
+      <button id="disasmToggle" title="逆アセンブル結果を表示">📋 逆アセンブル</button>
+      <span id="status">ファイル未選択</span>
+    </div>
+    <div id="gameArea">
+      <div id="dosbox-container"><span id="placeholder">⬆️ ここに .exe / .com / .zip をドロップ または選択</span></div>
+      <div id="pointerOverlay">🖱️ ゲーム画面をクリックしてマウスをキャプチャ</div>
+      <div id="disasmPanel">
+        <h3>🔍 逆アセンブル結果（先頭200命令）</h3>
+        <div id="disasm">まだ解析されていません</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function() {
+      const fileInput = document.getElementById('fileInput');
+      const statusDiv = document.getElementById('status');
+      const disasmDiv = document.getElementById('disasm');
+      const dosboxContainer = document.getElementById('dosbox-container');
+      const placeholder = document.getElementById('placeholder');
+      const pointerOverlay = document.getElementById('pointerOverlay');
+      const disasmPanel = document.getElementById('disasmPanel');
+      const disasmToggle = document.getElementById('disasmToggle');
+      const gameArea = document.getElementById('gameArea');
+
+      let currentDosbox = null;
+      let currentCanvas = null;
+
+      // 逆アセンブルパネル
+      let panelOpen = false;
+      disasmToggle.addEventListener('click', () => {
+        panelOpen = !panelOpen;
+        disasmPanel.classList.toggle('open', panelOpen);
+        disasmToggle.classList.toggle('active', panelOpen);
+      });
+
+      // Pointer Lock セットアップ
+      function setupPointerLock(canvas) {
+        if (!canvas) return;
+        if (currentCanvas) {
+          currentCanvas.removeEventListener('click', requestPointerLock);
+        }
+        currentCanvas = canvas;
+        canvas.addEventListener('click', requestPointerLock);
+        updatePointerOverlay();
+      }
+
+      function requestPointerLock() {
+        if (!currentCanvas || document.pointerLockElement === currentCanvas) return;
+        currentCanvas.requestPointerLock();
+      }
+
+      function updatePointerOverlay() {
+        const locked = document.pointerLockElement === currentCanvas;
+        if (locked) {
+          pointerOverlay.classList.remove('visible');
+          pointerOverlay.classList.add('locked');
+          if (currentCanvas) currentCanvas.style.cursor = 'none';
+        } else {
+          pointerOverlay.classList.add('visible');
+          pointerOverlay.classList.remove('locked');
+          if (currentCanvas) currentCanvas.style.cursor = 'default';
+        }
+      }
+
+      document.addEventListener('pointerlockchange', updatePointerOverlay);
+      document.addEventListener('pointerlockerror', () => {
+        console.warn('Pointer Lock 拒否');
+        pointerOverlay.classList.add('visible');
+      });
+
+      // canvas 監視
+      function observeCanvas() {
+        const observer = new MutationObserver(() => {
+          const canvas = dosboxContainer.querySelector('canvas');
+          if (canvas && canvas !== currentCanvas) {
+            setupPointerLock(canvas);
+          }
+        });
+        observer.observe(dosboxContainer, { childList: true, subtree: true });
+        return observer;
+      }
+      let canvasObserver = observeCanvas();
+
+      // ── ZIP から実行ファイルを取り出す関数 ──
+      async function extractExeFromZip(zipFile) {
+        const zip = await JSZip.loadAsync(zipFile);
+        // .exe または .com を優先して探す
+        let targetFile = null;
+        zip.forEach((relativePath, file) => {
+          if (!file.dir && !targetFile) {
+            const name = relativePath.toLowerCase();
+            if (name.endsWith('.exe') || name.endsWith('.com')) {
+              targetFile = file;
+            }
+          }
+        });
+        if (!targetFile) throw new Error('ZIP内に .exe または .com が見つかりません');
+        const data = await targetFile.async('uint8array');
+        const fileName = targetFile.name.split('/').pop(); // パスを除いたファイル名
+        return { bytes: data, name: fileName };
+      }
+
+      // ── ファイル処理 ──
+      fileInput.addEventListener('change', async (event) => {
+        const file = event.target.files[0];
+        if (!file) {
+          statusDiv.textContent = 'ファイル未選択';
+          return;
+        }
+
+        statusDiv.textContent = '読み込み中...';
+        disasmDiv.textContent = '解析中...';
+        placeholder.textContent = '準備中...';
+
+        // 停止
+        if (currentDosbox) {
+          try { await currentDosbox.stop(); } catch(e){}
+          currentDosbox = null;
+        }
+        if (document.pointerLockElement) document.exitPointerLock();
+        currentCanvas = null;
+        dosboxContainer.innerHTML = '';
+        dosboxContainer.appendChild(placeholder);
+        if (canvasObserver) canvasObserver.disconnect();
+        canvasObserver = observeCanvas();
+
+        try {
+          let bytes, exeName;
+
+          const fileNameLower = file.name.toLowerCase();
+          if (fileNameLower.endsWith('.zip')) {
+            // ZIP の場合は展開
+            statusDiv.textContent = 'ZIPを展開中...';
+            const extracted = await extractExeFromZip(file);
+            bytes = extracted.bytes;
+            exeName = extracted.name;
+            statusDiv.textContent = `${exeName} を実行します`;
+          } else if (fileNameLower.endsWith('.exe') || fileNameLower.endsWith('.com')) {
+            // 直接 EXE/COM
+            const arrayBuffer = await file.arrayBuffer();
+            bytes = new Uint8Array(arrayBuffer);
+            exeName = file.name;
+          } else {
+            throw new Error('未対応のファイル形式です');
+          }
+
+          // ── 1. 逆アセンブル ──
+          statusDiv.textContent = '逆アセンブル中...';
+          let disasmText = '';
+          try {
+            const rz = await new RzWeb();
+            await rz.load();
+            const fileId = rz.fileOpen(exeName, bytes);
+            rz.analyzeAll();
+            disasmText = rz.cmd("pd 200") || '(結果なし)';
+            rz.fileClose(fileId);
+          } catch (rzError) {
+            console.error(rzError);
+            disasmText = '逆アセンブルに失敗しました';
+          }
+          disasmDiv.textContent = disasmText;
+          if (!panelOpen) {
+            panelOpen = true;
+            disasmPanel.classList.add('open');
+            disasmToggle.classList.add('active');
+          }
+
+          // ── 2. DOSBox バンドル ──
+          statusDiv.textContent = 'バンドル作成中...';
+          const bundleZip = new JSZip();
+          const autoexec = `[autoexec]\n@echo off\nmount c .\nc:\n${exeName}\n`;
+          bundleZip.file("dosbox.conf", autoexec);
+          bundleZip.file(exeName, bytes);
+          const blob = await bundleZip.generateAsync({type:"blob"});
+          const bundleUrl = URL.createObjectURL(blob);
+
+          // ── 3. 実行 ──
+          statusDiv.textContent = 'DOSBox 起動中...';
+          placeholder.remove();
+          currentDosbox = await Dos(dosboxContainer, {
+            wdosboxUrl: "https://js-dos.com/6.22/current/wdosbox.js"
+          });
+          await currentDosbox.run(bundleUrl);
+          statusDiv.textContent = '✅ 実行中 — 画面クリックでマウスキャプチャ';
+          pointerOverlay.classList.add('visible');
+          setTimeout(() => URL.revokeObjectURL(bundleUrl), 10000);
+
+        } catch (error) {
+          console.error(error);
+          statusDiv.textContent = '❌ エラー: ' + error.message;
+          disasmDiv.textContent = disasmDiv.textContent || 'エラー';
+          dosboxContainer.innerHTML = '';
+          dosboxContainer.appendChild(placeholder);
+          placeholder.textContent = '起動失敗';
+        }
+      });
+
+      // ドラッグ＆ドロップ
+      gameArea.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        gameArea.style.outline = '2px dashed #bd93f9';
+        gameArea.style.outlineOffset = '-4px';
+      });
+      gameArea.addEventListener('dragleave', () => { gameArea.style.outline = ''; });
+      gameArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        gameArea.style.outline = '';
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+          const dt = new DataTransfer();
+          dt.items.add(files[0]);
+          fileInput.files = dt.files;
+          fileInput.dispatchEvent(new Event('change'));
+        }
+      });
+
+      // ショートカット
+      document.addEventListener('keydown', (e) => {
+        if (e.key === '`' && !e.ctrlKey && !e.altKey && !e.metaKey && document.activeElement === document.body) {
+          e.preventDefault();
+          disasmToggle.click();
+        }
+      });
+
+      console.log('🚀 DOS EXE Runner (ZIP対応) 準備完了');
+    })();
+  </script>
+</body>
+</html>
