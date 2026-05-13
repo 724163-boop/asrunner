@@ -2,15 +2,17 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>DOS EXE Runner (キャンバス直指定)</title>
+  <title>DOS EXE Runner (js-dos 6.22)</title>
+  <!-- js-dos 6.22 -->
   <script src="https://js-dos.com/6.22/current/js-dos.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
-    body { margin: 0; background: #000; }
+    body { margin: 0; background: #000; color: #fff; font-family: sans-serif; }
     #app { display: flex; flex-direction: column; height: 100vh; }
-    #topbar { background: #1a1a2e; color: #fff; padding: 8px 16px; display: flex; align-items: center; gap: 12px; }
+    #topbar { background: #1a1a2e; padding: 8px 16px; display: flex; align-items: center; gap: 12px; }
     #fileInput { color: #ccc; }
     #status { color: #8be9fd; font-size: 0.9rem; margin-left: auto; }
-    #gameArea { flex: 1; display: flex; align-items: center; justify-content: center; background: #000; }
+    #gameArea { flex: 1; display: flex; align-items: center; justify-content: center; background: #000; position: relative; }
     canvas { max-width: 100%; max-height: 100%; }
   </style>
 </head>
@@ -21,91 +23,105 @@
       <input type="file" id="fileInput" accept=".exe,.com,.zip">
       <span id="status">ファイルを選んでください</span>
     </div>
-    <div id="gameArea" id="gameArea">
+    <div id="gameArea">
       <!-- キャンバスはJSで動的に作成 -->
     </div>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script>
     (() => {
       const fileInput = document.getElementById('fileInput');
       const statusDiv = document.getElementById('status');
       const gameArea = document.getElementById('gameArea');
-      let currentDosbox = null;
-      let currentCanvas = null;
+      let currentCi = null; // CommandInterface → exit() で停止するため保持
 
-      // ZIP から .exe を取り出す
-      async function extractExeFromZip(file) {
-        const zip = await JSZip.loadAsync(file);
-        let target = null;
+      // ZIP 内の実行ファイル名を先に特定（パス付き）
+      async function findExeInZip(zipFile) {
+        const zip = await JSZip.loadAsync(zipFile);
+        let targetPath = null;
         zip.forEach((path, f) => {
-          if (!f.dir && !target && (path.toLowerCase().endsWith('.exe') || path.toLowerCase().endsWith('.com'))) {
-            target = f;
+          if (!f.dir && !targetPath && (path.toLowerCase().endsWith('.exe') || path.toLowerCase().endsWith('.com'))) {
+            targetPath = path; // "subdir/FOO.EXE" のようなパスも保持
           }
         });
-        if (!target) throw new Error('ZIP内に .exe / .com が見つかりません');
-        const data = await target.async('uint8array');
-        if (!data || data.length === 0) throw new Error('実行ファイルが空です');
-        return { bytes: data, name: target.name.split('/').pop() };
+        if (!targetPath) throw new Error('ZIP内に .exe / .com が見つかりません');
+        return targetPath;
       }
 
       fileInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
 
-        // 後片付け
-        if (currentDosbox) {
-          try { await currentDosbox.stop(); } catch(e) {}
-          currentDosbox = null;
+        // 後片付け：前回の DOSBox を完全停止
+        if (currentCi) {
+          try { currentCi.exit(); } catch(e) {}
+          currentCi = null;
         }
-        gameArea.innerHTML = ''; // キャンバスも消える
+        gameArea.innerHTML = '';
         statusDiv.textContent = '読み込み中...';
 
         try {
-          let bytes, exeName;
           const fname = file.name.toLowerCase();
+          let exePath; // ZIP内のパス付きファイル名、または単体ファイル名
+
+          // ZIP 内の実行ファイル名を事前に取得（必要なら）
           if (fname.endsWith('.zip')) {
-            statusDiv.textContent = 'ZIP展開中...';
-            const ext = await extractExeFromZip(file);
-            bytes = ext.bytes;
-            exeName = ext.name;
+            exePath = await findExeInZip(file);
           } else if (fname.endsWith('.exe') || fname.endsWith('.com')) {
-            const buf = await file.arrayBuffer();
-            bytes = new Uint8Array(buf);
-            exeName = file.name;
-            if (bytes.length === 0) throw new Error('ファイルが空です');
+            exePath = file.name;
           } else {
-            throw new Error('未対応の形式です');
+            throw new Error('未対応の形式です（.exe/.com/.zip のみ対応）');
           }
 
-          // バンドル作成
-          statusDiv.textContent = 'バンドル作成中...';
-          const bundle = new JSZip();
-          bundle.file('dosbox.conf', `[autoexec]\n@echo off\nmount c .\nc:\n${exeName}\n`);
-          bundle.file(exeName, bytes);
-          const blob = await bundle.generateAsync({type:'blob'});
-          const url = URL.createObjectURL(blob);
-
-          // キャンバスを用意
+          // キャンバス生成
           const canvas = document.createElement('canvas');
           canvas.style.width = '100%';
           canvas.style.height = '100%';
           gameArea.appendChild(canvas);
-          currentCanvas = canvas;
 
-          // DOSBox 生成（キャンバスを渡す）
+          // js-dos 6.22 初期化
           statusDiv.textContent = 'DOSBox 起動中...';
           if (typeof Dos !== 'function') throw new Error('js-dos が読み込まれていません');
-          const dos = await Dos(canvas, { wdosboxUrl: "https://js-dos.com/6.22/current/wdosbox.js" });
-          console.log('Dos instance:', dos);
-          if (!dos || typeof dos.run !== 'function') {
-            throw new Error('DOSBox インスタンスが不完全 (runがない)');
-          }
-          currentDosbox = dos;
-          await dos.run(url);
-          statusDiv.textContent = '✅ 実行中';
-          setTimeout(() => URL.revokeObjectURL(url), 15000);
+
+          Dos(canvas, {
+            wdosboxUrl: "https://js-dos.com/6.22/current/wdosbox.js"
+          }).ready(async (fs, main) => {
+            try {
+              if (fname.endsWith('.zip')) {
+                statusDiv.textContent = 'ZIPを展開中...';
+                const zip = await JSZip.loadAsync(file);
+                // ZIP 内の全ファイルをエミュレータ内に書き込み
+                const writes = [];
+                zip.forEach((path, f) => {
+                  if (f.dir) return;
+                  writes.push(
+                    f.async('uint8array').then(data => fs.createFile(path, data))
+                  );
+                });
+                await Promise.all(writes);
+              } else {
+                // 単体ファイルを書き込み
+                const buf = await file.arrayBuffer();
+                fs.createFile(file.name, new Uint8Array(buf));
+              }
+
+              // dosbox.conf を作成（autoexec で自動実行）
+              // exePath に \ が含まれる場合は / に統一して dosbox 形式に
+              const safePath = exePath.replace(/\\/g, '/');
+              const conf = `[autoexec]\n@echo off\nmount c .\nc:\n${safePath}\n`;
+              fs.createFile("dosbox.conf", conf);
+
+              statusDiv.textContent = '実行中...';
+              // DOSBox 起動（dosbox.conf を指定）
+              const ci = await main(["-conf", "dosbox.conf"]);
+              currentCi = ci;
+              statusDiv.textContent = '✅ 実行中';
+            } catch (err) {
+              console.error(err);
+              statusDiv.textContent = '❌ 実行エラー: ' + err.message;
+              gameArea.innerHTML = '<span style="color:#888;">起動失敗</span>';
+            }
+          });
 
         } catch (err) {
           console.error(err);
@@ -114,7 +130,7 @@
         }
       });
 
-      // ドラッグ＆ドロップ
+      // ドラッグ＆ドロップ対応
       gameArea.addEventListener('dragover', e => e.preventDefault());
       gameArea.addEventListener('drop', e => {
         e.preventDefault();
